@@ -200,6 +200,14 @@ func (ctx *Context) attention(layer *model.Layer, x *tensor.Tensor, layerIdx, po
 		}
 	}
 
+	// Per-head Q/K RMSNorm (Qwen3 / Qwen3MoE): applied BEFORE RoPE.
+	if layer.QNorm != nil {
+		applyPerHeadNorm(q.Data, hp.NumHeads, headDim, layer.QNorm.Data, hp.NormEps)
+	}
+	if layer.KNorm != nil {
+		applyPerHeadNorm(k.Data[:kvDim], hp.NumKVHeads, headDim, layer.KNorm.Data, hp.NormEps)
+	}
+
 	// --- RoPE (if arch uses it) ---
 	if hp.RopeFreqBase > 0 {
 		applyRoPE(q.Data, hp.NumHeads, headDim, pos, hp.RopeFreqBase)
@@ -215,7 +223,10 @@ func (ctx *Context) attention(layer *model.Layer, x *tensor.Tensor, layerIdx, po
 	// --- Scaled dot-product attention ---
 	// For each query head, compute attention over all past keys.
 	scale := float32(1.0 / math.Sqrt(float64(headDim)))
-	out := tensor.New(hp.HiddenSize)
+	// Attention output has shape [NumHeads × headDim], not HiddenSize.
+	// In standard MHA they're equal, but in Qwen3MoE: 32×128=4096 ≠ hidden=2048.
+	attnOutDim := hp.NumHeads * headDim
+	out := tensor.New(attnOutDim)
 
 	allK := ctx.KV.KeysUpTo(layerIdx) // [seqLen, kvDim]
 	allV := ctx.KV.ValsUpTo(layerIdx)
@@ -266,9 +277,13 @@ func (ctx *Context) attention(layer *model.Layer, x *tensor.Tensor, layerIdx, po
 }
 
 // ffn computes the feed-forward network for one token.
-// FFN weights are loaded from flash on demand.
+// MoE layers are dispatched to moeFFN; dense layers load from flash on demand.
 func (ctx *Context) ffn(layer *model.Layer, x *tensor.Tensor) (*tensor.Tensor, error) {
-	// If weights are not already in DRAM, load them from flash.
+	if layer.MoERouter != nil {
+		return moeFFN(ctx.Storage, 32, layer, x, ctx.Model.HParams)
+	}
+
+	// Dense FFN: load weights from flash if not already in DRAM.
 	if !layer.FFNLoaded() {
 		if err := ctx.loadFFNWeights(layer); err != nil {
 			return nil, err
@@ -440,6 +455,22 @@ func applyRoPE(vec []float32, nHeads, headDim, pos int, freqBase float32) {
 			x1 := head[i+halfDim]
 			head[i] = x0*cos - x1*sin
 			head[i+halfDim] = x0*sin + x1*cos
+		}
+	}
+}
+
+// applyPerHeadNorm applies RMSNorm independently to each head slice in vec.
+// vec has shape [nHeads * headDim]; weight is shared across all heads [headDim].
+func applyPerHeadNorm(vec []float32, nHeads, headDim int, weight []float32, eps float32) {
+	for h := 0; h < nHeads; h++ {
+		head := vec[h*headDim : (h+1)*headDim]
+		var ss float32
+		for _, v := range head {
+			ss += v * v
+		}
+		scale := float32(1.0 / math.Sqrt(float64(ss/float32(headDim))+float64(eps)))
+		for i, v := range head {
+			head[i] = v * scale * weight[i]
 		}
 	}
 }

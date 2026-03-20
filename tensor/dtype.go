@@ -154,7 +154,98 @@ func extractQ4KSubScale(scales []byte, sb int) (uint8, uint8) {
 	return 0, 0
 }
 
-// Dequantize converts raw bytes in the given GGML type to []float32.
+// DequantizeQ5_K dequantizes Q5_K blocks to float32.
+// Block layout (256 elements, 176 bytes):
+//   d[2]       — F16 super-scale
+//   dmin[2]    — F16 super-min
+//   scales[12] — 6-bit sub-scales (same packing as Q4_K)
+//   qh[32]     — upper (5th) bit for all 256 values (1 per bit, 8 per byte)
+//   qs[128]    — lower 4 bits for all 256 values (2 per byte)
+func DequantizeQ5_K(raw []byte) ([]float32, error) {
+	const blockSize = 256
+	const bytesPerBlock = 176
+	if len(raw)%bytesPerBlock != 0 {
+		return nil, fmt.Errorf("dtype: Q5_K data length %d not divisible by %d", len(raw), bytesPerBlock)
+	}
+	nBlocks := len(raw) / bytesPerBlock
+	out := make([]float32, nBlocks*blockSize)
+	for b := 0; b < nBlocks; b++ {
+		base := b * bytesPerBlock
+		d := float16ToFloat32(binary.LittleEndian.Uint16(raw[base:]))
+		dmin := float16ToFloat32(binary.LittleEndian.Uint16(raw[base+2:]))
+		scales := raw[base+4 : base+16]  // 12 bytes sub-scales
+		qh := raw[base+16 : base+48]     // 32 bytes high bits
+		qs := raw[base+48 : base+176]    // 128 bytes low nibbles
+
+		for i := 0; i < blockSize; i++ {
+			sb := i / 32
+			sc, mn := extractQ4KSubScale(scales, sb)
+
+			lo := qs[i/2]
+			var nibble uint8
+			if i%2 == 0 {
+				nibble = lo & 0x0F
+			} else {
+				nibble = lo >> 4
+			}
+			hi := (qh[i/8] >> uint(i%8)) & 1
+			q := uint8(nibble) | (hi << 4) // 5-bit value 0..31
+
+			out[b*blockSize+i] = d*float32(sc)*float32(q) - dmin*float32(mn)
+		}
+	}
+	return out, nil
+}
+
+
+// Block layout (256 elements, 210 bytes):
+//   ql[128]    — lower 4 bits for all 256 values (2 per byte)
+//   qh[64]     — upper 2 bits for all 256 values (4 per byte)
+//   scales[16] — int8 scale per 16 elements
+//   d[2]       — F16 super-scale (at end)
+func DequantizeQ6_K(raw []byte) ([]float32, error) {
+	const blockSize = 256
+	const bytesPerBlock = 210
+	if len(raw)%bytesPerBlock != 0 {
+		return nil, fmt.Errorf("dtype: Q6_K data length %d not divisible by %d", len(raw), bytesPerBlock)
+	}
+	nBlocks := len(raw) / bytesPerBlock
+	out := make([]float32, nBlocks*blockSize)
+	for b := 0; b < nBlocks; b++ {
+		base := b * bytesPerBlock
+		ql := raw[base : base+128]
+		qh := raw[base+128 : base+192]
+		sc := raw[base+192 : base+208] // int8 scales
+		d := float16ToFloat32(binary.LittleEndian.Uint16(raw[base+208:]))
+
+		outBase := b * blockSize
+		// Two halves of 128 elements each (n = 0, then 128).
+		for half := 0; half < 2; half++ {
+			qlOff := half * 64
+			qhOff := half * 32
+			scOff := half * 8
+			nOff := half * 128
+			for l := 0; l < 32; l++ {
+				is := l / 16
+				q1 := int8((ql[qlOff+l]&0x0F)|((qh[qhOff+l]>>0&0x03)<<4)) - 32
+				q2 := int8((ql[qlOff+l+32]&0x0F)|((qh[qhOff+l]>>2&0x03)<<4)) - 32
+				q3 := int8((ql[qlOff+l]>>4)|((qh[qhOff+l]>>4&0x03)<<4)) - 32
+				q4 := int8((ql[qlOff+l+32]>>4)|((qh[qhOff+l]>>6&0x03)<<4)) - 32
+				s0 := float32(int8(sc[scOff+is+0]))
+				s2 := float32(int8(sc[scOff+is+2]))
+				s4 := float32(int8(sc[scOff+is+4]))
+				s6 := float32(int8(sc[scOff+is+6]))
+				out[outBase+nOff+l+0] = d * s0 * float32(q1)
+				out[outBase+nOff+l+32] = d * s2 * float32(q2)
+				out[outBase+nOff+l+64] = d * s4 * float32(q3)
+				out[outBase+nOff+l+96] = d * s6 * float32(q4)
+			}
+		}
+	}
+	return out, nil
+}
+
+
 func Dequantize(raw []byte, dtype gguf.GGMLType) ([]float32, error) {
 	switch dtype {
 	case gguf.GGMLTypeF32:
@@ -167,6 +258,10 @@ func Dequantize(raw []byte, dtype gguf.GGMLType) ([]float32, error) {
 		return DequantizeQ4_0(raw)
 	case gguf.GGMLTypeQ4_K:
 		return DequantizeQ4_K(raw)
+	case gguf.GGMLTypeQ5_K:
+		return DequantizeQ5_K(raw)
+	case gguf.GGMLTypeQ6_K:
+		return DequantizeQ6_K(raw)
 	default:
 		return nil, fmt.Errorf("dtype: dequantization not implemented for %s", dtype)
 	}

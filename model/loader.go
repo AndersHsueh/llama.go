@@ -56,7 +56,7 @@ func (l *Loader) build() (*Model, error) {
 	switch arch {
 	case "falcon":
 		m.Activation = ActivationGELU
-	case "llama", "mistral":
+	case "llama", "mistral", "qwen2", "qwen3", "qwen3moe":
 		m.Activation = ActivationSiLU
 	default:
 		m.Activation = ActivationReLU
@@ -149,6 +149,15 @@ func (l *Loader) loadHParams(arch string) (HParams, error) {
 	}
 	hp.MaxSeqLen = hp.ContextLen
 
+	// Explicit per-head key/value dimensions (Qwen3, Qwen3MoE).
+	hp.HeadDimK, _ = l.metaInt(pfx + "attention.key_length")
+	hp.HeadDimV, _ = l.metaInt(pfx + "attention.value_length")
+
+	// MoE parameters (zero for dense models).
+	hp.NumExperts, _ = l.metaInt(pfx + "expert_count")
+	hp.NumExpertsPerToken, _ = l.metaInt(pfx + "expert_used_count")
+	hp.ExpertFFNSize, _ = l.metaInt(pfx + "expert_feed_forward_length")
+
 	return hp, nil
 }
 
@@ -189,6 +198,10 @@ func (l *Loader) loadLayer(arch string, i int) (*Layer, error) {
 	layer.Bv, _ = l.tryLoadTensor(p + "attn_v.bias")
 	layer.Bo, _ = l.tryLoadTensor(p + "attn_output.bias")
 
+	// Per-head Q/K norm (Qwen3, Qwen3MoE).
+	layer.QNorm, _ = l.tryLoadTensor(p + "attn_q_norm.weight")
+	layer.KNorm, _ = l.tryLoadTensor(p + "attn_k_norm.weight")
+
 	// --- FFN norm ---
 	layer.FFNNorm, err = l.mustLoadTensor(p + "ffn_norm.weight")
 	if err != nil {
@@ -196,7 +209,24 @@ func (l *Loader) loadLayer(arch string, i int) (*Layer, error) {
 	}
 	layer.FFNNormB, _ = l.tryLoadTensor(p + "ffn_norm.bias")
 
-	// --- FFN weights: record TensorInfo only, do NOT load into DRAM ---
+	// --- MoE layers (qwen3moe and similar) ---
+	if l.file.TensorsByName[p+"ffn_gate_inp.weight"] != nil {
+		// Router weight [n_experts, hidden] — small enough to keep in DRAM.
+		layer.MoERouter, err = l.mustLoadTensor(p + "ffn_gate_inp.weight")
+		if err != nil {
+			return nil, err
+		}
+		// Expert weights: 3D tensors, stay on flash.
+		layer.ExpertGateInfo = l.file.TensorsByName[p+"ffn_gate_exps.weight"]
+		layer.ExpertUpInfo = l.file.TensorsByName[p+"ffn_up_exps.weight"]
+		layer.ExpertDownInfo = l.file.TensorsByName[p+"ffn_down_exps.weight"]
+		if layer.ExpertUpInfo == nil || layer.ExpertDownInfo == nil {
+			return nil, fmt.Errorf("missing MoE expert tensors at layer %d", i)
+		}
+		return layer, nil
+	}
+
+	// --- Dense FFN weights: record TensorInfo only, do NOT load into DRAM ---
 	layer.FFNUpInfo = l.file.TensorsByName[p+"ffn_up.weight"]
 	layer.FFNGateInfo = l.file.TensorsByName[p+"ffn_gate.weight"]
 	layer.FFNDownInfo = l.file.TensorsByName[p+"ffn_down.weight"]
@@ -265,6 +295,10 @@ func (m *Model) PrintSummary() {
 		hp.VocabSize, hp.HiddenSize, hp.FFNHiddenSize, hp.NumLayers, hp.NumHeads, hp.NumKVHeads)
 	fmt.Printf("  norm_eps=%.1e  rope_base=%.0f  ctx=%d\n",
 		hp.NormEps, hp.RopeFreqBase, hp.ContextLen)
+	if hp.IsMoE() {
+		fmt.Printf("  MoE: total_experts=%d  active_per_token=%d  expert_ffn=%d\n",
+			hp.NumExperts, hp.NumExpertsPerToken, hp.ExpertFFNSize)
+	}
 
 	var dramBytes int64
 	countTensor := func(t *tensor.Tensor) {

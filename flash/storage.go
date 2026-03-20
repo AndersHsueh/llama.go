@@ -109,6 +109,81 @@ func (s *Storage) ReadRows(ti *gguf.TensorInfo, rows []int) (*tensor.Tensor, err
 	return out, nil
 }
 
+// ReadFlatRows reads specific rows from any tensor treated as a flat 2D matrix.
+// The "columns" dimension is Dimensions[0] (innermost), and the total row count
+// is the product of all remaining dimensions. This enables slicing 3D expert
+// tensors (e.g. [hidden, expertFF, nExperts]) without modification.
+func (s *Storage) ReadFlatRows(ti *gguf.TensorInfo, rows []int, nThreads int) (*tensor.Tensor, error) {
+	inDim := int(ti.Dimensions[0])
+	var totalRows int64 = 1
+	for i := 1; i < len(ti.Dimensions); i++ {
+		totalRows *= int64(ti.Dimensions[i])
+	}
+
+	rowByteSize, err := ti.Type.ByteSize(int64(inDim))
+	if err != nil {
+		return nil, err
+	}
+
+	out := tensor.New(len(rows), inDim)
+	errs := make([]error, len(rows))
+
+	type work struct {
+		destRow int
+		srcRow  int
+	}
+	jobs := make(chan work, len(rows))
+	for i, r := range rows {
+		jobs <- work{i, r}
+	}
+	close(jobs)
+
+	if nThreads <= 0 {
+		nThreads = 32
+	}
+
+	var wg sync.WaitGroup
+	for t := 0; t < nThreads; t++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			f, ferr := os.Open(s.path)
+			if ferr != nil {
+				for job := range jobs {
+					errs[job.destRow] = ferr
+				}
+				return
+			}
+			defer f.Close()
+			for job := range jobs {
+				if int64(job.srcRow) >= totalRows {
+					errs[job.destRow] = fmt.Errorf("row %d out of range [0,%d)", job.srcRow, totalRows)
+					continue
+				}
+				offset := int64(ti.Offset) + int64(job.srcRow)*rowByteSize
+				buf := make([]byte, rowByteSize)
+				if _, rerr := f.ReadAt(buf, offset); rerr != nil {
+					errs[job.destRow] = rerr
+					continue
+				}
+				rowData, derr := tensor.Dequantize(buf, ti.Type)
+				if derr != nil {
+					errs[job.destRow] = derr
+					continue
+				}
+				copy(out.Data[job.destRow*inDim:], rowData)
+			}
+		}()
+	}
+	wg.Wait()
+	for i, e := range errs {
+		if e != nil {
+			return nil, fmt.Errorf("flash.ReadFlatRows row[%d]: %w", i, e)
+		}
+	}
+	return out, nil
+}
+
 // ReadRowsParallel reads specific rows in parallel using nThreads goroutines.
 // For large batches of rows, this significantly reduces wall-clock latency
 // by overlapping I/O (matching the paper's 32-thread strategy).

@@ -62,6 +62,10 @@ func NewFlashContext(m *model.Model, storagePath string, maxSeq int, cfg FlashFF
 		hp := m.HParams
 		fc.caches = make([]*NeuronCache, hp.NumLayers)
 		for i, layer := range m.Layers {
+			// MoE layers use their own expert routing — skip windowing cache.
+			if layer.MoERouter != nil {
+				continue
+			}
 			if layer.FFNUpInfo == nil || layer.FFNDownInfo == nil {
 				continue
 			}
@@ -181,6 +185,7 @@ func (fc *FlashContext) forwardLayerFlash(layer *model.Layer, x *tensor.Tensor, 
 }
 
 // ffnFlash computes FFN with the following priority:
+//  0. If MoE layer → dispatch directly to moeFFN (all paths bypass windowing).
 //  1. If windowing cache exists for this layer → use NeuronCache (windowing + bundling).
 //  2. Else if predictor exists → predict active neurons, load only those rows.
 //  3. Else → fall back to loading all FFN weights (naive).
@@ -188,6 +193,11 @@ func (fc *FlashContext) forwardLayerFlash(layer *model.Layer, x *tensor.Tensor, 
 // attnOut is passed as input to the activation predictor (paper improvement:
 // use current layer's attn output, not previous layer's FFN output).
 func (fc *FlashContext) ffnFlash(layer *model.Layer, x, attnOut *tensor.Tensor, layerIdx int) (*tensor.Tensor, error) {
+	// --- Path 0: MoE layer ---
+	if layer.MoERouter != nil {
+		return moeFFN(fc.Storage, fc.cfg.NThreads, layer, x, fc.Model.HParams)
+	}
+
 	m := fc.Model
 
 	actFn := activationFn(m.Activation)
