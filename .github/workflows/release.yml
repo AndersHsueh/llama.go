@@ -1,0 +1,61 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: macos-latest   # Apple Silicon runner (M-series)
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: Build — Apple Silicon (arm64)
+        run: |
+          CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 \
+            go build -ldflags="-s -w" -o dist/llama.go_darwin_arm64 .
+
+      - name: Build — Intel Mac (amd64)
+        run: |
+          CGO_ENABLED=1 GOOS=darwin GOARCH=amd64 \
+            CC="clang -arch x86_64" \
+            go build -ldflags="-s -w" -o dist/llama.go_darwin_amd64 .
+
+      - name: Create Universal Binary
+        run: |
+          lipo -create \
+            dist/llama.go_darwin_arm64 \
+            dist/llama.go_darwin_amd64 \
+            -output dist/llama.go_darwin_universal
+          lipo -info dist/llama.go_darwin_universal
+
+      - name: Package
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          cd dist
+          zip "llama.go_${VERSION}_darwin_arm64.zip" \
+            llama.go_darwin_arm64 \
+            ../LICENSE ../README.md ../README_en.md ../README_jp.md
+          zip "llama.go_${VERSION}_darwin_universal.zip" \
+            llama.go_darwin_universal \
+            ../LICENSE ../README.md ../README_en.md ../README_jp.md
+
+      - name: Create GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          gh release create "${VERSION}" \
+            --title "llama.go ${VERSION}" \
+            --notes-file .github/release-notes.md \
+            dist/llama.go_${VERSION}_darwin_arm64.zip \
+            dist/llama.go_${VERSION}_darwin_universal.zip
