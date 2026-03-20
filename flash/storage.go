@@ -23,10 +23,21 @@ type Storage struct {
 }
 
 // Open opens the GGUF file at path for tensor data reads.
+// On Darwin (macOS), F_NOCACHE is set so the OS does not buffer file pages in
+// the unified buffer cache — this is the recommended "direct I/O" mode on Apple
+// platforms and is essential for keeping flash reads out of RAM (see "LLM in a
+// Flash", §4 "Direct I/O").
 func Open(path string) (*Storage, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("flash.Open: %w", err)
+	}
+	// F_NOCACHE (macOS) — disable OS page caching for this fd.
+	// This prevents the 19 GB model file from filling the page cache during
+	// prefill and causing OOM kills.
+	if err := setNocache(f); err != nil {
+		// Non-fatal: fall back to cached I/O.
+		_ = err
 	}
 	return &Storage{f: f, path: path}, nil
 }
@@ -37,6 +48,51 @@ func (s *Storage) Close() error {
 }
 
 // ReadRaw reads byteSize bytes starting at offset from flash into a new byte slice.
+// ReadRaw reads byteSize bytes starting at offset from flash into a provided buffer.
+// If rawBuf is nil or too small, a new one is allocated. Returns the used buffer.
+func (s *Storage) ReadRawInto(offset int64, byteSize int64, rawBuf []byte) ([]byte, error) {
+	if int64(cap(rawBuf)) < byteSize {
+		rawBuf = make([]byte, byteSize)
+	}
+	buf := rawBuf[:byteSize]
+	n, err := s.f.ReadAt(buf, offset)
+	if err != nil && err != io.EOF {
+		return nil, fmt.Errorf("flash.ReadRawInto offset=%d size=%d: %w", offset, byteSize, err)
+	}
+	if int64(n) < byteSize {
+		return nil, fmt.Errorf("flash.ReadRawInto: short read %d/%d", n, byteSize)
+	}
+	return buf, nil
+}
+
+// ReadContiguousRows reads nRows contiguous rows starting at startRow into dst.
+// dst must have length >= nRows * Dimensions[0]. This is a single sequential read
+// (optimal for flash I/O) and avoids any extra allocation when dst is provided.
+// Used by MoE expert loading to read all rows for one expert in one syscall.
+func (s *Storage) ReadContiguousRows(ti *gguf.TensorInfo, startRow, nRows int, dst []float32, rawBuf []byte) ([]byte, error) {
+	inDim := int(ti.Dimensions[0])
+	rowByteSize, err := ti.Type.ByteSize(int64(inDim))
+	if err != nil {
+		return nil, err
+	}
+	totalBytes := rowByteSize * int64(nRows)
+	offset := int64(ti.Offset) + int64(startRow)*rowByteSize
+
+	rawBuf, err = s.ReadRawInto(offset, totalBytes, rawBuf)
+	if err != nil {
+		return nil, err
+	}
+
+	// Dequantize block-by-block into dst to avoid allocating a new slice.
+	// We dequantize 'nRows' row-blocks worth of data.
+	rowData, err := tensor.DequantizeInto(rawBuf, ti.Type, dst[:nRows*inDim])
+	if err != nil {
+		return nil, err
+	}
+	_ = rowData
+	return rawBuf, nil
+}
+
 // This is the fundamental primitive — all higher-level reads are built on this.
 func (s *Storage) ReadRaw(offset int64, byteSize int64) ([]byte, error) {
 	buf := make([]byte, byteSize)

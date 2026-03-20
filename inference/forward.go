@@ -13,6 +13,34 @@ import (
 	"llama.go/tensor"
 )
 
+// ExpertScratch holds pre-allocated buffers reused across all expert calls.
+// Using fixed buffers eliminates the 18MB/expert temporary allocations that
+// would otherwise cause GC pressure during MoE prefill.
+type ExpertScratch struct {
+	// GateUpBuf: holds one expert's gate OR up projection rows [expertFF × hidden].
+	// Reused for both gate and up (sequentially).
+	GateUpBuf []float32
+	// DownBuf: holds one expert's down projection rows [hidden × expertFF].
+	DownBuf []float32
+	// Gate, Up, H: intermediate expertFF-sized vectors.
+	Gate []float32
+	Up   []float32
+	H    []float32
+	// RawBuf: byte buffer for raw I/O, reused to avoid allocs.
+	RawBuf []byte
+}
+
+// NewExpertScratch pre-allocates scratch buffers for one expert at a time.
+func NewExpertScratch(expertFF, hidden int) *ExpertScratch {
+	return &ExpertScratch{
+		GateUpBuf: make([]float32, expertFF*hidden),
+		DownBuf:   make([]float32, hidden*expertFF),
+		Gate:      make([]float32, expertFF),
+		Up:        make([]float32, expertFF),
+		H:         make([]float32, expertFF),
+	}
+}
+
 // Context holds inference state: the model, KV cache, flash storage,
 // and optional Metal GPU device for accelerated matrix operations.
 type Context struct {
@@ -23,6 +51,10 @@ type Context struct {
 
 	// DRAMBudgetBytes is the soft limit for FFN DRAM usage (0 = unlimited).
 	DRAMBudgetBytes int64
+
+	// ExpertScratch holds pre-allocated buffers for MoE expert computation.
+	// Nil for non-MoE models.
+	ExpertScratch *ExpertScratch
 }
 
 // NewContext creates an inference context.
@@ -51,6 +83,11 @@ func NewContext(m *model.Model, storagePath string, maxSeq int, useGPU bool) (*C
 			return nil, fmt.Errorf("inference: metal init: %w", err)
 		}
 		ctx.GPU = dev // nil if GPU not available (no error)
+	}
+
+	// Pre-allocate expert scratch buffers for MoE models.
+	if hp.IsMoE() && hp.ExpertFFNSize > 0 {
+		ctx.ExpertScratch = NewExpertScratch(hp.ExpertFFNSize, hp.HiddenSize)
 	}
 
 	return ctx, nil
@@ -280,7 +317,7 @@ func (ctx *Context) attention(layer *model.Layer, x *tensor.Tensor, layerIdx, po
 // MoE layers are dispatched to moeFFN; dense layers load from flash on demand.
 func (ctx *Context) ffn(layer *model.Layer, x *tensor.Tensor) (*tensor.Tensor, error) {
 	if layer.MoERouter != nil {
-		return moeFFN(ctx.Storage, 32, layer, x, ctx.Model.HParams)
+		return moeFFN(ctx.Storage, ctx.ExpertScratch, layer, x, ctx.Model.HParams)
 	}
 
 	// Dense FFN: load weights from flash if not already in DRAM.

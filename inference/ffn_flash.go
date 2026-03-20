@@ -195,7 +195,7 @@ func (fc *FlashContext) forwardLayerFlash(layer *model.Layer, x *tensor.Tensor, 
 func (fc *FlashContext) ffnFlash(layer *model.Layer, x, attnOut *tensor.Tensor, layerIdx int) (*tensor.Tensor, error) {
 	// --- Path 0: MoE layer ---
 	if layer.MoERouter != nil {
-		return moeFFN(fc.Storage, fc.cfg.NThreads, layer, x, fc.Model.HParams)
+		return moeFFN(fc.Storage, fc.ExpertScratch, layer, x, fc.Model.HParams)
 	}
 
 	m := fc.Model

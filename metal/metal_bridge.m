@@ -130,37 +130,55 @@ int llama_metal_matvec(LlamaMetalDevice dev,
 {
     LlamaMetalCtx* ctx = (LlamaMetalCtx*)dev;
 
-    // On Apple Silicon, MTLResourceStorageModeShared means zero-copy CPU↔GPU.
-    id<MTLBuffer> wBuf = [ctx->device newBufferWithBytes:w
-                                                  length:(NSUInteger)(rows*cols)*sizeof(float)
-                                                 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> xBuf = [ctx->device newBufferWithBytes:x
-                                                  length:(NSUInteger)cols*sizeof(float)
-                                                 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> yBuf = [ctx->device newBufferWithLength:(NSUInteger)rows*sizeof(float)
-                                                  options:MTLResourceStorageModeShared];
-    uint32_t cols32 = (uint32_t)cols;
-    id<MTLBuffer> cBuf = [ctx->device newBufferWithBytes:&cols32
-                                                  length:sizeof(uint32_t)
-                                                 options:MTLResourceStorageModeShared];
+    @autoreleasepool {
+        // newBufferWithBytesNoCopy: wraps existing CPU memory without copying.
+        // On Apple Silicon (unified memory) this is truly zero-copy CPU↔GPU.
+        // The page_size alignment requirement is met by Go's mmap-based allocator
+        // for all large tensors (Wq/Wk/Wv/Wo are all ≥ 4 KB).
+        NSUInteger wLen = (NSUInteger)(rows * cols) * sizeof(float);
+        NSUInteger xLen = (NSUInteger)cols * sizeof(float);
+        NSUInteger yLen = (NSUInteger)rows * sizeof(float);
 
-    id<MTLCommandBuffer>         cmd = [ctx->queue commandBuffer];
-    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-    [enc setComputePipelineState:ctx->psoMatvec];
-    [enc setBuffer:wBuf offset:0 atIndex:0];
-    [enc setBuffer:xBuf offset:0 atIndex:1];
-    [enc setBuffer:yBuf offset:0 atIndex:2];
-    [enc setBuffer:cBuf offset:0 atIndex:3];
+        id<MTLBuffer> wBuf = [ctx->device newBufferWithBytesNoCopy:(void*)w
+                                                            length:wLen
+                                                           options:MTLResourceStorageModeShared
+                                                       deallocator:nil];
+        id<MTLBuffer> xBuf = [ctx->device newBufferWithBytesNoCopy:(void*)x
+                                                            length:xLen
+                                                           options:MTLResourceStorageModeShared
+                                                       deallocator:nil];
+        // Fallback for small x (< page size): must copy since NoCopy requires page-aligned.
+        if (xBuf == nil) {
+            xBuf = [ctx->device newBufferWithBytes:x length:xLen options:MTLResourceStorageModeShared];
+        }
+        if (wBuf == nil) {
+            wBuf = [ctx->device newBufferWithBytes:w length:wLen options:MTLResourceStorageModeShared];
+        }
 
-    NSUInteger tgW = ctx->psoMatvec.maxTotalThreadsPerThreadgroup;
-    if (tgW > (NSUInteger)rows) tgW = (NSUInteger)rows;
-    [enc dispatchThreads:MTLSizeMake((NSUInteger)rows, 1, 1)
-     threadsPerThreadgroup:MTLSizeMake(tgW, 1, 1)];
-    [enc endEncoding];
-    [cmd commit];
-    [cmd waitUntilCompleted];
+        id<MTLBuffer> yBuf = [ctx->device newBufferWithLength:yLen options:MTLResourceStorageModeShared];
+        uint32_t cols32 = (uint32_t)cols;
+        id<MTLBuffer> cBuf = [ctx->device newBufferWithBytes:&cols32
+                                                      length:sizeof(uint32_t)
+                                                     options:MTLResourceStorageModeShared];
 
-    memcpy(y, [yBuf contents], (size_t)rows * sizeof(float));
+        id<MTLCommandBuffer>         cmd = [ctx->queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:ctx->psoMatvec];
+        [enc setBuffer:wBuf offset:0 atIndex:0];
+        [enc setBuffer:xBuf offset:0 atIndex:1];
+        [enc setBuffer:yBuf offset:0 atIndex:2];
+        [enc setBuffer:cBuf offset:0 atIndex:3];
+
+        NSUInteger tgW = ctx->psoMatvec.maxTotalThreadsPerThreadgroup;
+        if (tgW > (NSUInteger)rows) tgW = (NSUInteger)rows;
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)rows, 1, 1)
+         threadsPerThreadgroup:MTLSizeMake(tgW, 1, 1)];
+        [enc endEncoding];
+        [cmd commit];
+        [cmd waitUntilCompleted];
+
+        memcpy(y, [yBuf contents], yLen);
+    } // @autoreleasepool — releases all Metal buffers immediately
     return 0;
 }
 
@@ -173,38 +191,40 @@ int llama_metal_rmsnorm(LlamaMetalDevice dev,
 {
     LlamaMetalCtx* ctx = (LlamaMetalCtx*)dev;
 
-    size_t sz = (size_t)n * sizeof(float);
-    id<MTLBuffer> xBuf = [ctx->device newBufferWithBytes:x      length:sz options:MTLResourceStorageModeShared];
-    id<MTLBuffer> wBuf = [ctx->device newBufferWithBytes:weight  length:sz options:MTLResourceStorageModeShared];
-    id<MTLBuffer> oBuf = [ctx->device newBufferWithLength:sz             options:MTLResourceStorageModeShared];
+    @autoreleasepool {
+        size_t sz = (size_t)n * sizeof(float);
+        id<MTLBuffer> xBuf = [ctx->device newBufferWithBytes:x      length:sz options:MTLResourceStorageModeShared];
+        id<MTLBuffer> wBuf = [ctx->device newBufferWithBytes:weight  length:sz options:MTLResourceStorageModeShared];
+        id<MTLBuffer> oBuf = [ctx->device newBufferWithLength:sz             options:MTLResourceStorageModeShared];
 
-    uint32_t n32 = (uint32_t)n;
-    id<MTLBuffer> nBuf = [ctx->device newBufferWithBytes:&n32  length:sizeof(uint32_t) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> eBuf = [ctx->device newBufferWithBytes:&eps  length:sizeof(float)    options:MTLResourceStorageModeShared];
+        uint32_t n32 = (uint32_t)n;
+        id<MTLBuffer> nBuf = [ctx->device newBufferWithBytes:&n32  length:sizeof(uint32_t) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> eBuf = [ctx->device newBufferWithBytes:&eps  length:sizeof(float)    options:MTLResourceStorageModeShared];
 
-    // Use 128 threads per threadgroup for the reduction.
-    NSUInteger tgSize = 128;
-    if (tgSize > ctx->psoRMSNorm.maxTotalThreadsPerThreadgroup)
-        tgSize = ctx->psoRMSNorm.maxTotalThreadsPerThreadgroup;
+        // Use 128 threads per threadgroup for the reduction.
+        NSUInteger tgSize = 128;
+        if (tgSize > ctx->psoRMSNorm.maxTotalThreadsPerThreadgroup)
+            tgSize = ctx->psoRMSNorm.maxTotalThreadsPerThreadgroup;
 
-    id<MTLCommandBuffer>         cmd = [ctx->queue commandBuffer];
-    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-    [enc setComputePipelineState:ctx->psoRMSNorm];
-    [enc setBuffer:xBuf offset:0 atIndex:0];
-    [enc setBuffer:wBuf offset:0 atIndex:1];
-    [enc setBuffer:oBuf offset:0 atIndex:2];
-    [enc setBuffer:nBuf offset:0 atIndex:3];
-    [enc setBuffer:eBuf offset:0 atIndex:4];
-    // threadgroup(0) = shared memory for reduction.
-    [enc setThreadgroupMemoryLength:tgSize * sizeof(float) atIndex:0];
+        id<MTLCommandBuffer>         cmd = [ctx->queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:ctx->psoRMSNorm];
+        [enc setBuffer:xBuf offset:0 atIndex:0];
+        [enc setBuffer:wBuf offset:0 atIndex:1];
+        [enc setBuffer:oBuf offset:0 atIndex:2];
+        [enc setBuffer:nBuf offset:0 atIndex:3];
+        [enc setBuffer:eBuf offset:0 atIndex:4];
+        // threadgroup(0) = shared memory for reduction.
+        [enc setThreadgroupMemoryLength:tgSize * sizeof(float) atIndex:0];
 
-    // 1 threadgroup of tgSize threads — enough for n≤4096.
-    [enc dispatchThreads:MTLSizeMake(tgSize, 1, 1)
-     threadsPerThreadgroup:MTLSizeMake(tgSize, 1, 1)];
-    [enc endEncoding];
-    [cmd commit];
-    [cmd waitUntilCompleted];
+        // 1 threadgroup of tgSize threads — enough for n≤4096.
+        [enc dispatchThreads:MTLSizeMake(tgSize, 1, 1)
+         threadsPerThreadgroup:MTLSizeMake(tgSize, 1, 1)];
+        [enc endEncoding];
+        [cmd commit];
+        [cmd waitUntilCompleted];
 
-    memcpy(out, [oBuf contents], sz);
+        memcpy(out, [oBuf contents], sz);
+    } // @autoreleasepool — releases all Metal buffers immediately
     return 0;
 }

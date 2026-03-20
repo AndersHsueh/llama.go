@@ -86,6 +86,7 @@ func Generate(args []string) error {
 	var lastLogits []float32
 	t1 := time.Now()
 	for pos, id := range ids {
+		fmt.Fprintf(os.Stderr, "  prefill tok %d/%d...\r", pos+1, len(ids))
 		logits, err := ctx.ForwardFlash(id, pos)
 		if err != nil {
 			return fmt.Errorf("prefill pos %d: %w", pos, err)
@@ -93,6 +94,7 @@ func Generate(args []string) error {
 		ctx.KV.Commit()
 		lastLogits = logits
 	}
+	fmt.Fprintf(os.Stderr, "\n")
 	prefillMs := time.Since(t1).Milliseconds()
 	fmt.Fprintf(os.Stderr, "Prefill: %d tokens in %dms (%.1f ms/tok)\n",
 		len(ids), prefillMs, float64(prefillMs)/float64(len(ids)))

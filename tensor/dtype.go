@@ -267,6 +267,152 @@ func Dequantize(raw []byte, dtype gguf.GGMLType) ([]float32, error) {
 	}
 }
 
+// DequantizeInto writes dequantized values directly into dst — zero heap allocation.
+// dst must hold at least (len(raw) / bytesPerBlock) * 256 float32 values.
+// Returns a slice of dst resliced to the actual output length.
+func DequantizeInto(raw []byte, dtype gguf.GGMLType, dst []float32) ([]float32, error) {
+	switch dtype {
+	case gguf.GGMLTypeQ4_K:
+		return dequantizeQ4KInto(raw, dst)
+	case gguf.GGMLTypeQ5_K:
+		return dequantizeQ5KInto(raw, dst)
+	case gguf.GGMLTypeQ6_K:
+		return dequantizeQ6KInto(raw, dst)
+	default:
+		// Fallback: allocate + copy for less-common types.
+		out, err := Dequantize(raw, dtype)
+		if err != nil {
+			return nil, err
+		}
+		if len(dst) < len(out) {
+			return nil, fmt.Errorf("DequantizeInto: dst too small (%d < %d)", len(dst), len(out))
+		}
+		n := copy(dst, out)
+		return dst[:n], nil
+	}
+}
+
+// dequantizeQ4KInto writes Q4_K blocks directly into dst (zero alloc).
+func dequantizeQ4KInto(raw []byte, dst []float32) ([]float32, error) {
+	const blockSize = 256
+	const bytesPerBlock = 144
+	if len(raw)%bytesPerBlock != 0 {
+		return nil, fmt.Errorf("dtype: Q4_K data length %d not divisible by %d", len(raw), bytesPerBlock)
+	}
+	nBlocks := len(raw) / bytesPerBlock
+	need := nBlocks * blockSize
+	if len(dst) < need {
+		return nil, fmt.Errorf("DequantizeInto Q4_K: dst too small (%d < %d)", len(dst), need)
+	}
+	for b := 0; b < nBlocks; b++ {
+		base := b * bytesPerBlock
+		dSuper := float16ToFloat32(binary.LittleEndian.Uint16(raw[base:]))
+		dminSuper := float16ToFloat32(binary.LittleEndian.Uint16(raw[base+2:]))
+		scales := raw[base+4 : base+16]
+		qs := raw[base+16 : base+144]
+		outBase := b * blockSize
+		for sb := 0; sb < 8; sb++ {
+			sc, mn := extractQ4KSubScale(scales, sb)
+			d := dSuper * float32(sc)
+			dmin := dminSuper * float32(mn)
+			for i := 0; i < 32; i++ {
+				idx := sb*32 + i
+				byteIdx := idx / 2
+				var q uint8
+				if idx%2 == 0 {
+					q = qs[byteIdx] & 0x0F
+				} else {
+					q = qs[byteIdx] >> 4
+				}
+				dst[outBase+idx] = d*float32(q) - dmin
+			}
+		}
+	}
+	return dst[:need], nil
+}
+
+// dequantizeQ5KInto writes Q5_K blocks directly into dst (zero alloc).
+func dequantizeQ5KInto(raw []byte, dst []float32) ([]float32, error) {
+	const blockSize = 256
+	const bytesPerBlock = 176
+	if len(raw)%bytesPerBlock != 0 {
+		return nil, fmt.Errorf("dtype: Q5_K data length %d not divisible by %d", len(raw), bytesPerBlock)
+	}
+	nBlocks := len(raw) / bytesPerBlock
+	need := nBlocks * blockSize
+	if len(dst) < need {
+		return nil, fmt.Errorf("DequantizeInto Q5_K: dst too small (%d < %d)", len(dst), need)
+	}
+	for b := 0; b < nBlocks; b++ {
+		base := b * bytesPerBlock
+		d := float16ToFloat32(binary.LittleEndian.Uint16(raw[base:]))
+		dmin := float16ToFloat32(binary.LittleEndian.Uint16(raw[base+2:]))
+		scales := raw[base+4 : base+16]
+		qh := raw[base+16 : base+48]
+		qs := raw[base+48 : base+176]
+		outBase := b * blockSize
+		for i := 0; i < blockSize; i++ {
+			sb := i / 32
+			sc, mn := extractQ4KSubScale(scales, sb)
+			lo := qs[i/2]
+			var nibble uint8
+			if i%2 == 0 {
+				nibble = lo & 0x0F
+			} else {
+				nibble = lo >> 4
+			}
+			hi := (qh[i/8] >> uint(i%8)) & 1
+			q := nibble | (hi << 4)
+			dst[outBase+i] = d*float32(sc)*float32(q) - dmin*float32(mn)
+		}
+	}
+	return dst[:need], nil
+}
+
+// dequantizeQ6KInto writes Q6_K blocks directly into dst (zero alloc).
+func dequantizeQ6KInto(raw []byte, dst []float32) ([]float32, error) {
+	const blockSize = 256
+	const bytesPerBlock = 210
+	if len(raw)%bytesPerBlock != 0 {
+		return nil, fmt.Errorf("dtype: Q6_K data length %d not divisible by %d", len(raw), bytesPerBlock)
+	}
+	nBlocks := len(raw) / bytesPerBlock
+	need := nBlocks * blockSize
+	if len(dst) < need {
+		return nil, fmt.Errorf("DequantizeInto Q6_K: dst too small (%d < %d)", len(dst), need)
+	}
+	for b := 0; b < nBlocks; b++ {
+		base := b * bytesPerBlock
+		ql := raw[base : base+128]
+		qh := raw[base+128 : base+192]
+		sc := raw[base+192 : base+208]
+		dv := float16ToFloat32(binary.LittleEndian.Uint16(raw[base+208:]))
+		outBase := b * blockSize
+		for half := 0; half < 2; half++ {
+			qlOff := half * 64
+			qhOff := half * 32
+			scOff := half * 8
+			nOff := half * 128
+			for l := 0; l < 32; l++ {
+				is := l / 16
+				q1 := int8((ql[qlOff+l]&0x0F)|((qh[qhOff+l]>>0&0x03)<<4)) - 32
+				q2 := int8((ql[qlOff+l+32]&0x0F)|((qh[qhOff+l]>>2&0x03)<<4)) - 32
+				q3 := int8((ql[qlOff+l]>>4)|((qh[qhOff+l]>>4&0x03)<<4)) - 32
+				q4 := int8((ql[qlOff+l+32]>>4)|((qh[qhOff+l]>>6&0x03)<<4)) - 32
+				s0 := float32(int8(sc[scOff+is+0]))
+				s2 := float32(int8(sc[scOff+is+2]))
+				s4 := float32(int8(sc[scOff+is+4]))
+				s6 := float32(int8(sc[scOff+is+6]))
+				dst[outBase+nOff+l+0] = dv * s0 * float32(q1)
+				dst[outBase+nOff+l+32] = dv * s2 * float32(q2)
+				dst[outBase+nOff+l+64] = dv * s4 * float32(q3)
+				dst[outBase+nOff+l+96] = dv * s6 * float32(q4)
+			}
+		}
+	}
+	return dst[:need], nil
+}
+
 // float16ToFloat32 converts a 16-bit IEEE 754 half-precision float to float32.
 func float16ToFloat32(h uint16) float32 {
 	sign := uint32(h>>15) << 31
