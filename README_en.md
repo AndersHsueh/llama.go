@@ -7,6 +7,24 @@ Run large language models with weights stored on **Flash (SSD)** — no need to 
 
 ---
 
+## Download
+
+| Platform | File |
+|----------|------|
+| 🍎 Apple Silicon (M1 / M2 / M3 / M4) | [llama.go_v0.0.1_darwin_arm64.zip](https://github.com/AndersHsueh/llama.go/releases/download/v0.0.1/llama.go_v0.0.1_darwin_arm64.zip) |
+| 🍎 Universal (Apple Silicon + Intel Mac) | [llama.go_v0.0.1_darwin_universal.zip](https://github.com/AndersHsueh/llama.go/releases/download/v0.0.1/llama.go_v0.0.1_darwin_universal.zip) |
+
+All releases: [Releases page](https://github.com/AndersHsueh/llama.go/releases)
+
+```bash
+# Grant execute permission after unzipping.
+# On first launch macOS may block the binary — run this to remove the quarantine flag:
+chmod +x llama.go_darwin_arm64
+xattr -d com.apple.quarantine llama.go_darwin_arm64
+```
+
+---
+
 ## Core Idea
 
 Large models like Falcon 7B exhibit ~**95% activation sparsity** in their FFN layers after ReLU — most neurons output zero for any given token. The paper exploits this with three techniques:

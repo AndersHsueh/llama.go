@@ -7,6 +7,23 @@
 
 ---
 
+## ダウンロード
+
+| プラットフォーム | ファイル |
+|----------------|---------|
+| 🍎 Apple Silicon（M1 / M2 / M3 / M4） | [llama.go_v0.0.1_darwin_arm64.zip](https://github.com/AndersHsueh/llama.go/releases/download/v0.0.1/llama.go_v0.0.1_darwin_arm64.zip) |
+| 🍎 Universal（Apple Silicon + Intel Mac） | [llama.go_v0.0.1_darwin_universal.zip](https://github.com/AndersHsueh/llama.go/releases/download/v0.0.1/llama.go_v0.0.1_darwin_universal.zip) |
+
+全リリース：[Releases ページ](https://github.com/AndersHsueh/llama.go/releases)
+
+```bash
+# 解凍後に実行権限を付与。初回起動時に macOS がブロックする場合は以下を実行：
+chmod +x llama.go_darwin_arm64
+xattr -d com.apple.quarantine llama.go_darwin_arm64
+```
+
+---
+
 ## 基本的なアイデア
 
 Falcon 7B のような大規模モデルでは、ReLU 活性化後の FFN 層において約 **95% のニューロンがゼロを出力する**（活性化スパース性）という特性があります。  

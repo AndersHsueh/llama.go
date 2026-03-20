@@ -7,6 +7,23 @@
 
 ---
 
+## 下载
+
+| 平台 | 文件 |
+|------|------|
+| 🍎 Apple Silicon（M1 / M2 / M3 / M4） | [llama.go_v0.0.1_darwin_arm64.zip](https://github.com/AndersHsueh/llama.go/releases/download/v0.0.1/llama.go_v0.0.1_darwin_arm64.zip) |
+| 🍎 Universal（Apple Silicon + Intel Mac） | [llama.go_v0.0.1_darwin_universal.zip](https://github.com/AndersHsueh/llama.go/releases/download/v0.0.1/llama.go_v0.0.1_darwin_universal.zip) |
+
+全部 Release 版本：[Releases 页面](https://github.com/AndersHsueh/llama.go/releases)
+
+```bash
+# 下载后赋予执行权限（首次运行需要在「隐私与安全性」中允许，或执行下方命令）
+chmod +x llama.go_darwin_arm64
+xattr -d com.apple.quarantine llama.go_darwin_arm64
+```
+
+---
+
 ## 核心原理
 
 大模型（如 Falcon 7B）的 FFN 层在 ReLU 激活后约有 **95% 的神经元输出为零**（激活稀疏性）。  
